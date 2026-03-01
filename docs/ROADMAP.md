@@ -12,7 +12,7 @@ Each step is designed to be a discrete unit of work suitable for a single implem
 
 | Step | Feature | Description | Key Files | Depends On |
 |------|---------|-------------|-----------|------------|
-| 1 | **GGUF loader** | Parse header, metadata KV pairs, tensor descriptors. Memory-map tensor data section via `MemoryMappedFile`. | `Models/Gguf/GgufReader.cs`, `GgufMetadata.cs`, `GgufTensorDescriptor.cs` | — |
+| 1 | **GGUF loader** :white_check_mark: | Parse header, metadata KV pairs, tensor descriptors. Memory-map tensor data section via `MemoryMappedFile`. | `Models/Gguf/GgufReader.cs`, `GgufMetadata.cs`, `GgufTensorDescriptor.cs` | — |
 | 2 | **FP16/Q8_0 dequantization** | Dequantize FP16 (trivial: half→float) and Q8_0 (scale × int8). Validates tensor data access through mmap. | `Cpu/Kernels/Dequantize.cs` | 1 |
 | 3 | **Basic CPU tensor ops** | MatMul (GEMV for single-token decode), RMSNorm, SiLU, Softmax. Use `TensorPrimitives` + SIMD intrinsics. Scalar reference implementations for correctness validation. | `Cpu/Kernels/MatMul.cs`, `RmsNorm.cs`, `SiLu.cs`, `Softmax.cs` | — |
 | 4 | **BPE tokenizer** | Parse vocabulary and merges from GGUF metadata (`tokenizer.ggml.tokens`, `tokenizer.ggml.scores`). Trie-based encode, simple decode. | `Tokenizers/Bpe/BpeTokenizer.cs`, `Tokenizers/Trie.cs` | 1 |
