@@ -20,6 +20,12 @@ public static unsafe partial class MatMul
     /// <summary>Number of elements per Q8_0 block.</summary>
     private const int Q8_0GroupSize = 32;
 
+    /// <summary>Q8_1 block size in bytes: 2 (Half d) + 2 (Half s) + 32 (sbyte quantized values).</summary>
+    public const int Q8_1BlockBytes = 36;
+
+    /// <summary>Number of elements per Q8_1 block.</summary>
+    private const int Q8_1GroupSize = 32;
+
     /// <summary>Stackalloc threshold in bytes. Above this, use ArrayPool.</summary>
     private const int StackAllocThreshold = 8192;
 
@@ -707,6 +713,157 @@ public static unsafe partial class MatMul
                 Vector256<sbyte> packed = Avx2.PackSignedSaturate(s0, s1);
 
                 // Fix lane-crossing.
+                Vector256<int> permuted = Avx2.PermuteVar8x32(packed.AsInt32(),
+                    Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7));
+
+                permuted.AsByte().StoreUnsafe(ref Unsafe.AsRef<byte>((byte*)qs));
+            }
+        }
+    }
+
+    // ──────────────────── Q8_1 Quantization ────────────────────
+
+    /// <summary>
+    /// Quantizes f32 data to Q8_1 format. Per block of 32 floats:
+    /// d = max(|x[i]|) / 127, qs[i] = round(x[i] / d) clamped to [-127, 127],
+    /// s = d * sum(qs[0..31]). Layout: Half d (2) + Half s (2) + sbyte[32] (32) = 36 bytes.
+    /// Dispatches to AVX2 → scalar at runtime.
+    /// </summary>
+    /// <param name="src">Source f32 data. Must have <paramref name="elementCount"/> elements.</param>
+    /// <param name="dest">Destination Q8_1 buffer. Must have (elementCount/32) × 36 bytes.</param>
+    /// <param name="elementCount">Number of float elements. Must be a multiple of 32.</param>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeF32ToQ8_1(float* src, byte* dest, int elementCount)
+    {
+        if (elementCount % Q8_1GroupSize != 0)
+            throw new ArgumentException(
+                $"elementCount must be a multiple of {Q8_1GroupSize}, got {elementCount}",
+                nameof(elementCount));
+
+        if (Avx2.IsSupported)
+            QuantizeF32ToQ8_1Avx2(src, dest, elementCount);
+        else
+            QuantizeF32ToQ8_1Scalar(src, dest, elementCount);
+    }
+
+    /// <summary>
+    /// Scalar Q8_1 quantization reference implementation.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void QuantizeF32ToQ8_1Scalar(float* src, byte* dest, int elementCount)
+    {
+        int blockCount = elementCount / Q8_1GroupSize;
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            float* blockSrc = src + block * Q8_1GroupSize;
+            byte* blockDst = dest + block * Q8_1BlockBytes;
+
+            // Find max absolute value.
+            float maxAbs = 0;
+            for (int i = 0; i < Q8_1GroupSize; i++)
+            {
+                float abs = MathF.Abs(blockSrc[i]);
+                if (abs > maxAbs) maxAbs = abs;
+            }
+
+            float scale = maxAbs / 127.0f;
+            Unsafe.WriteUnaligned(blockDst, (Half)scale);
+
+            sbyte* qs = (sbyte*)(blockDst + 4);
+            if (scale == 0)
+            {
+                for (int i = 0; i < Q8_1GroupSize; i++)
+                    qs[i] = 0;
+                Unsafe.WriteUnaligned(blockDst + 2, (Half)0f);
+            }
+            else
+            {
+                float invScale = 1.0f / scale;
+                int sum = 0;
+                for (int i = 0; i < Q8_1GroupSize; i++)
+                {
+                    int v = (int)MathF.Round(blockSrc[i] * invScale);
+                    v = Math.Clamp(v, -127, 127);
+                    qs[i] = (sbyte)v;
+                    sum += v;
+                }
+                Unsafe.WriteUnaligned(blockDst + 2, (Half)(scale * sum));
+            }
+        }
+    }
+
+    /// <summary>
+    /// AVX2 Q8_1 quantization. Same pack pipeline as Q8_0 but additionally computes
+    /// <c>s = d * sum(qs)</c> from the int32 vectors before packing.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void QuantizeF32ToQ8_1Avx2(float* src, byte* dest, int elementCount)
+    {
+        int blockCount = elementCount / Q8_1GroupSize;
+        for (int block = 0; block < blockCount; block++)
+        {
+            float* blockSrc = src + block * Q8_1GroupSize;
+            byte* blockDst = dest + block * Q8_1BlockBytes;
+
+            // Max-abs scan: 4 loads of 8 floats.
+            Vector256<float> v0 = Vector256.Abs(Avx.LoadVector256(blockSrc));
+            Vector256<float> v1 = Vector256.Abs(Avx.LoadVector256(blockSrc + 8));
+            Vector256<float> v2 = Vector256.Abs(Avx.LoadVector256(blockSrc + 16));
+            Vector256<float> v3 = Vector256.Abs(Avx.LoadVector256(blockSrc + 24));
+
+            Vector256<float> max01 = Avx.Max(v0, v1);
+            Vector256<float> max23 = Avx.Max(v2, v3);
+            Vector256<float> maxAll = Avx.Max(max01, max23);
+            float maxAbs = HorizontalMaxAvx2(maxAll);
+
+            float scale = maxAbs / 127.0f;
+            Unsafe.WriteUnaligned(blockDst, (Half)scale);
+
+            sbyte* qs = (sbyte*)(blockDst + 4);
+            if (scale == 0)
+            {
+                Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs));
+                Unsafe.WriteUnaligned(blockDst + 2, (Half)0f);
+            }
+            else
+            {
+                Vector256<float> vInvScale = Vector256.Create(1.0f / scale);
+
+                Vector256<int> i0 = Avx.ConvertToVector256Int32(
+                    Avx.Multiply(Avx.LoadVector256(blockSrc), vInvScale));
+                Vector256<int> i1 = Avx.ConvertToVector256Int32(
+                    Avx.Multiply(Avx.LoadVector256(blockSrc + 8), vInvScale));
+                Vector256<int> i2 = Avx.ConvertToVector256Int32(
+                    Avx.Multiply(Avx.LoadVector256(blockSrc + 16), vInvScale));
+                Vector256<int> i3 = Avx.ConvertToVector256Int32(
+                    Avx.Multiply(Avx.LoadVector256(blockSrc + 24), vInvScale));
+
+                // Clamp int32 to [-127, 127] before summing so the stored sum
+                // matches the saturated qs values (cvtps2dq can produce out-of-range
+                // values for non-finite inputs).
+                Vector256<int> clampMin = Vector256.Create(-127);
+                Vector256<int> clampMax = Vector256.Create(127);
+                i0 = Avx2.Min(Avx2.Max(i0, clampMin), clampMax);
+                i1 = Avx2.Min(Avx2.Max(i1, clampMin), clampMax);
+                i2 = Avx2.Min(Avx2.Max(i2, clampMin), clampMax);
+                i3 = Avx2.Min(Avx2.Max(i3, clampMin), clampMax);
+
+                // Sum all 32 int32 values (2 vpaddd + Vector256.Sum)
+                Vector256<int> isum = Avx2.Add(Avx2.Add(i0, i1), Avx2.Add(i2, i3));
+                int sum = Vector256.Sum(isum);
+
+                Unsafe.WriteUnaligned(blockDst + 2, (Half)(scale * sum));
+
+                // Pack int32 → int16 (saturating).
+                Vector256<short> s01 = Avx2.PackSignedSaturate(i0, i1);
+                Vector256<short> s23 = Avx2.PackSignedSaturate(i2, i3);
+
+                // Pack int16 → int8 (saturating).
+                Vector256<sbyte> packed = Avx2.PackSignedSaturate(s01, s23);
+
+                // Fix AVX2 lane-crossing.
                 Vector256<int> permuted = Avx2.PermuteVar8x32(packed.AsInt32(),
                     Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7));
 
