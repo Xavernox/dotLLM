@@ -195,7 +195,7 @@ jobs:
           dotnet publish src/DotLLM.Cli/DotLLM.Cli.csproj \
             -c Release \
             -r ${{ matrix.rid }} \
-            /p:PublishAot=true \
+            -p:PublishAot=true \
             -o publish-aot/${{ matrix.rid }}
 
       - name: Stage release payload
